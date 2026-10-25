@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,6 +11,9 @@ import torch.nn as nn
 
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
     Qwen3TTSCode2Wav,
+)
+from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2DecoderConfig,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -112,28 +116,34 @@ def _make_model(
     stage_connector_config=None,
     async_chunk: bool = False,
     device: torch.device | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    decoder_config: Qwen3TTSTokenizerV2DecoderConfig | None = None,
 ) -> Qwen3TTSCode2Wav:
-    dec_config = _fake_dec_config()
+    dec_config = decoder_config or _fake_dec_config()
     tok_config = SimpleNamespace(
         decoder_config=dec_config,
         output_sample_rate=_OUTPUT_SAMPLE_RATE,
     )
-    with (
-        patch(
-            "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.Qwen3TTSTokenizerV2Config.from_pretrained",
-            return_value=tok_config,
-        ),
-        patch(
-            "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.Qwen3TTSTokenizerV2Decoder._from_config",
-            return_value=_FakeDecoder(),
-        ),
-    ):
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.Qwen3TTSTokenizerV2Config.from_pretrained",
+                return_value=tok_config,
+            )
+        )
+        if decoder_config is None:
+            stack.enter_context(
+                patch(
+                    "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.Qwen3TTSTokenizerV2Decoder._from_config",
+                    return_value=_FakeDecoder(),
+                )
+            )
         model = Qwen3TTSCode2Wav(
             vllm_config=SimpleNamespace(
                 load_config=SimpleNamespace(),
                 model_config=SimpleNamespace(
                     model="unused",
-                    dtype=torch.bfloat16,
+                    dtype=dtype,
                     revision=None,
                     stage_connector_config=stage_connector_config,
                     async_chunk=async_chunk,
@@ -767,16 +777,47 @@ def test_invalid_decode_chunking_is_rejected():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_load_weights_uses_model_dtype_before_precomputing_caches(dtype):
-    model = _make_model()
-    model.vllm_config.model_config.dtype = dtype
-    model.decoder = nn.Linear(2, 2)
+def test_load_weights_preserves_rope_precision_and_parameter_dtype(dtype, monkeypatch):
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=32,
+        hidden_size=16,
+        latent_dim=16,
+        codebook_dim=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_quantizers=2,
+        decoder_dim=32,
+        upsample_rates=(8, 5, 4, 3),
+        upsampling_ratios=(2, 2),
+        sliding_window=72,
+        rope_theta=10000.0,
+    )
+    model = _make_model(dtype=dtype, decoder_config=config)
+    frequencies = {name: value.clone() for name, value in model.decoder.named_buffers() if name.endswith("inv_freq")}
+    assert frequencies
+    # The four FP32 frequencies for head_dim=8 must not be quantized by initialization.
+    for value in frequencies.values():
+        torch.testing.assert_close(value, torch.tensor([1.0, 0.1, 0.01, 0.001], dtype=torch.float32), rtol=0, atol=0)
+    parameter_dtypes = {parameter.dtype for parameter in model.decoder.parameters()}
     cache_dtypes = []
-    model.decoder.precompute_snake_caches = lambda: cache_dtypes.append(model.decoder.weight.dtype)
+    precompute = model.decoder.precompute_snake_caches
+
+    def record_cache_dtype():
+        cache_dtypes.append({parameter.dtype for parameter in model.decoder.parameters()})
+        precompute()
+
+    monkeypatch.setattr(model.decoder, "precompute_snake_caches", record_cache_dtype)
 
     assert _load_weights_noop(model) == {"decoder.fake_weight"}
-    assert model.decoder.weight.dtype is dtype
-    assert cache_dtypes == [dtype]
+    for name, expected in frequencies.items():
+        actual = model.decoder.get_buffer(name)
+        assert actual.dtype is torch.float32
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert parameter_dtypes == {dtype}
+    assert {parameter.dtype for parameter in model.decoder.parameters()} == {dtype}
+    assert cache_dtypes == [{dtype}]
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])

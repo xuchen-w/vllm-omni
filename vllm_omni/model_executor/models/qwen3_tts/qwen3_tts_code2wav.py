@@ -112,7 +112,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             subfolder=self.tokenizer_subfolder,
         )
         dec_config = tok_config.decoder_config
-        self.decoder = Qwen3TTSTokenizerV2Decoder._from_config(dec_config)
+        # Set parameter precision during construction, retaining explicitly
+        # FP32 buffers such as the rotary frequencies during device transfer.
+        self.decoder = Qwen3TTSTokenizerV2Decoder._from_config(dec_config, dtype=vllm_config.model_config.dtype)
         self.decoder.eval()
 
         self._num_quantizers = int(dec_config.num_quantizers)
@@ -605,7 +607,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         )
 
         device = self.vllm_config.device_config.device
-        self.decoder.to(device=device, dtype=self.vllm_config.model_config.dtype)
+        self.decoder.to(device=device)
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(self.decoder, "precompute_snake_caches"):
