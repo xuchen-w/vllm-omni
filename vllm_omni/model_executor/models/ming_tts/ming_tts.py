@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -38,6 +38,7 @@ from .config_ming_tts import (
 )
 from .patch_emission import MING_STOP_REASON_KEY
 from .prompt_encoder import _resolve_prompt_latents
+from .request_state import request_state_key
 from .speaker_extractor import _resolve_speaker_embeddings
 
 
@@ -80,6 +81,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         else:
             raise ValueError(f"Invalid Ming model_stage={self.model_stage}")
         self.make_empty_intermediate_tensors = getattr(self.model, "make_empty_intermediate_tensors", lambda: None)
+        self.requires_request_ids = getattr(self.model, "requires_request_ids", False)
 
     @cached_property
     def sampler(self):
@@ -94,6 +96,9 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
 
     def forward(self, *args: Any, **kwargs: Any):
         return self.model(*args, **kwargs)
+
+    def on_requests_finished(self, req_ids: set[str]) -> None:
+        self.model.on_requests_finished(req_ids)
 
     def compute_logits(self, hidden_states, sampling_metadata=None):
         return self.model.compute_logits(hidden_states, sampling_metadata=sampling_metadata)
@@ -126,6 +131,8 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
     def preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info_dict: Any):
         if self.model_stage != "llm":
             return input_ids, input_embeds, {}
+        if "req_id" in info_dict:
+            info_dict.setdefault("request_id", info_dict["req_id"])
         input_embeds = self.model.embed_input_ids(input_ids).clone()
         return (
             self._prefill_preprocess(input_ids, input_embeds, **info_dict)
@@ -136,7 +143,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
     def postprocess(self, hidden_states: torch.Tensor, **info_dict: Any) -> dict[str, Any]:
         if self.model_stage != "llm" or hidden_states.numel() == 0:
             return {}
-        req_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
+        req_id = request_state_key(info_dict)
         pending = self.model.pop_postprocess_update(req_id)
         if not pending or not isinstance(pending.get("ming_latent_patch"), torch.Tensor):
             return {}
@@ -153,7 +160,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         if isinstance(stop_reason, str):
             update[MING_STOP_REASON_KEY] = stop_reason
         if isinstance(req_id, str):
-            update[KEY_REQUEST_ID] = req_id
+            update[KEY_REQUEST_ID] = info_dict.get(KEY_REQUEST_ID, req_id)
         return update
 
     def _prefill_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: Any):

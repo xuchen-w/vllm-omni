@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/audio_tokenizer/modeling_audio_vae.py
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .config_ming_tts import KEY_CHUNK_ID, KEY_REQUEST_ID, MingTTSConfig
 from .patch_emission import MING_STOP_REASON_KEY
+from .request_state import request_state_key
 
 logger = init_logger(__name__)
 
@@ -31,6 +32,7 @@ _MAX_STREAM_STATES = 1024
 
 class MingAudioVAEModel(nn.Module):
     input_modalities = "audio"
+    requires_request_ids = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -106,6 +108,7 @@ class MingAudioVAEModel(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         model_intermediate_buffer: list[dict[str, Any]] | None = None,
+        request_ids: list[str] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         del input_ids, positions, intermediate_tensors, inputs_embeds
@@ -116,6 +119,8 @@ class MingAudioVAEModel(nn.Module):
             info_list = runtime_infos if isinstance(runtime_infos, list) else None
         info_list = info_list or [{}]
         num_reqs = max(len(info_list), 1)
+        if request_ids is not None and len(request_ids) != num_reqs:
+            raise ValueError(f"Expected {num_reqs} request ids, got {len(request_ids)}")
         sr_tensor = torch.tensor(int(self.ming_config.sample_rate), dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32, device=self.vllm_config.device_config.device)
 
@@ -131,7 +136,7 @@ class MingAudioVAEModel(nn.Module):
                 raise RuntimeError(
                     f"Ming Stage-2 received a payload without {KEY_REQUEST_ID}. keys={sorted(info.keys())}"
                 )
-            request_id = _resolve_request_id(info, idx)
+            request_id = _resolve_request_id(info, idx, request_ids)
             self._touch_request_state(request_id)
             chunk_id = _coerce_optional_int(_first_present(info.get(KEY_CHUNK_ID), kv_meta.get(KEY_CHUNK_ID)))
             finished = _coerce_finished(
@@ -278,6 +283,10 @@ class MingAudioVAEModel(nn.Module):
             )
         return loaded
 
+    def on_requests_finished(self, req_ids: set[str]) -> None:
+        for req_id in req_ids:
+            self._clear_request_state(req_id)
+
     def _clear_request_state(self, request_id: str) -> None:
         self._past_key_values.pop(request_id, None)
         self._stream_state.pop(request_id, None)
@@ -333,13 +342,10 @@ def _coerce_optional_int(value: Any, default: int | None = None) -> int | None:
         return default
 
 
-def _resolve_request_id(info: dict[str, Any], idx: int) -> str:
-    kv_meta = info.get("kv_metadata") or {}
-    request_id = info.get(KEY_REQUEST_ID) or kv_meta.get(KEY_REQUEST_ID)
+def _resolve_request_id(info: dict[str, Any], idx: int, request_ids: list[str] | None = None) -> str:
+    request_id = request_state_key(info, request_ids[idx] if request_ids is not None else None)
     if request_id is None:
         return str(idx)
-    if not isinstance(request_id, str) or not request_id:
-        raise RuntimeError(f"Ming Stage-2 received invalid request id: {request_id!r}")
     return request_id
 
 

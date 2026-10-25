@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
@@ -33,7 +33,6 @@ from .config_ming_tts import (
     KEY_MAX_DECODE_STEPS,
     KEY_MIN_DECODE_STEPS,
     KEY_NEXT_EMBEDS,
-    KEY_REQUEST_ID,
     KEY_SIGMA,
     KEY_TEMPERATURE,
     KEY_TEXT_MODE,
@@ -55,6 +54,7 @@ from .patch_emission import (
     _resolve_runtime_int,
     _validate_ming_decode_window,
 )
+from .request_state import request_state_key
 
 logger = init_logger(__name__)
 
@@ -196,7 +196,7 @@ class MingLLMModel(nn.Module):
             if end <= cursor:
                 continue
             req_info = request_infos[req_idx] if req_idx < len(request_infos) else {}
-            req_id = req_info.get(KEY_REQUEST_ID)
+            req_id = request_state_key(req_info)
             req_history = _coerce_latent_history(
                 req_info.get(KEY_LATENT_HISTORY), device=hidden_states.device, dtype=self.fm_dtype, cfg=self.ming_config
             )
@@ -277,8 +277,12 @@ class MingLLMModel(nn.Module):
             intermediate_tensors=intermediate_tensors,
         )
 
-    def pop_postprocess_update(self, req_id: str) -> dict[str, Any]:
+    def pop_postprocess_update(self, req_id: str | None) -> dict[str, Any]:
         return self._pending_postprocess_updates.pop(req_id, {}) if isinstance(req_id, str) else {}
+
+    def on_requests_finished(self, req_ids: set[str]) -> None:
+        for req_id in req_ids:
+            self._pending_postprocess_updates.pop(req_id, None)
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor | None:
         del sampling_metadata

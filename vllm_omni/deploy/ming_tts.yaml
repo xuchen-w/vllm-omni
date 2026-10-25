@@ -54,3 +54,13 @@ stages:
       top_k: -1
       max_tokens: 1
       detokenize: false
+
+platforms:
+  mps:
+    model_runner: v2
+    stages:
+      - stage_id: 0
+        max_num_seqs: 8
+        kv_cache_memory_bytes: 536870912
+      - stage_id: 1
+        max_num_seqs: 8

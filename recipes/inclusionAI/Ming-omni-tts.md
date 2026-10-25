@@ -16,11 +16,33 @@
 - [Huggingface: inclusionAI/Ming-omni-tts-0.5B](https://huggingface.co/inclusionAI/Ming-omni-tts-0.5B)
 - Upstream repository [inclusionAI/Ming-omni-tts](https://github.com/inclusionAI/Ming-omni-tts)
 
-
 ## Hardware Support
 
-This recipe documents a validated ROCm configuration and a CUDA configuration for the dense 0.5B and the MoE 16.8B two-stage TTS pipeline deployment.
-Other hardware is welcome as community validation lands.
+This recipe documents ROCm and CUDA configurations for dense 0.5B and MoE 16.8B,
+and an MPS configuration for dense 0.5B through the vllm-metal Omni preview.
+
+## Apple Silicon / MPS
+
+Install the compatible vllm-metal Omni preview using its
+[MPS integration guide](https://github.com/vllm-project/vllm-metal/pull/1109).
+From this Omni checkout, start the dense model with its explicit deployment:
+
+```bash
+VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  vllm-omni serve inclusionAI/Ming-omni-tts-0.5B --omni \
+  --deploy-config vllm_omni/deploy/ming_tts.yaml \
+  --host 127.0.0.1 --port 8091
+```
+
+The `mps` profile uses v2 runners, eager execution, eight request slots per
+stage, and a 512 MiB AR KV-cache budget. The speech API examples below also
+apply to the dense model. Output is mono 44.1 kHz; streaming emits PCM.
+
+Local validation uses an M5 Pro, PyTorch 2.13.0 and vLLM 0.31.0, with optional
+CPU fallback disabled. It covers client concurrency 1/4/8, complete WAV output,
+and cancellation while another request remains active, followed by a new
+request. Flow sampling remains stochastic; matching an API seed does not
+establish waveform equality across requests or batch schedules.
 
 ## CUDA
 

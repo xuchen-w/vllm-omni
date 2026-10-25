@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,9 @@ from vllm_omni.model_executor.models.common.ming.spk_embedding import SpkembExtr
 from vllm_omni.model_executor.models.ming_tts.constants import (
     AGGREGATOR_HIDDEN_SIZE,
     HISTORY_PATCH_SIZE,
+    KEY_LATENT_HISTORY,
+    KEY_NEXT_EMBEDS,
+    KEY_REQUEST_ID,
     KEY_SPEAKER_EMBEDDING,
     KEY_SPEAKER_SAMPLE_RATES,
     KEY_SPEAKER_WAVEFORM,
@@ -34,6 +38,8 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     SPEAKER_EMBEDDING_DIM,
     VAE_PATCH_SIZE,
 )
+from vllm_omni.model_executor.models.ming_tts.ming_tts import MingTTSForConditionalGeneration
+from vllm_omni.model_executor.models.ming_tts.ming_tts_audio_vae import MingAudioVAEModel
 from vllm_omni.model_executor.models.ming_tts.ming_tts_llm import MingLLMModel
 from vllm_omni.model_executor.models.ming_tts.speaker_extractor import _resolve_speaker_embeddings
 from vllm_omni.model_executor.models.ming_tts.validation import validate_ming_tts_config
@@ -399,3 +405,83 @@ def test_ming_compute_logits_text_mode_delegates_to_backbone():
 
     assert torch.equal(model.model.hidden_states, hidden_states)
     assert torch.equal(logits, torch.ones((2, 3)))
+
+
+def test_ming_pending_updates_use_runner_identity_and_retire_finished_requests():
+    model = _make_ming_logits_model()
+    pending = {
+        "ming_latent_patch": torch.ones((1, 4)),
+        KEY_LATENT_HISTORY: torch.ones((2, 4)),
+        KEY_NEXT_EMBEDS: torch.ones((1, 4)),
+    }
+    model._pending_postprocess_updates = {"internal-a": pending, "internal-b": pending}
+    wrapper = SimpleNamespace(model=model, model_stage="llm")
+
+    update = MingTTSForConditionalGeneration.postprocess(
+        wrapper, torch.ones((1, 4)), req_id="internal-a", **{KEY_REQUEST_ID: "external-a"}
+    )
+    assert update[KEY_REQUEST_ID] == "external-a"
+    assert set(model._pending_postprocess_updates) == {"internal-b"}
+
+    model._pending_postprocess_updates["cancelled"] = pending
+    MingTTSForConditionalGeneration.on_requests_finished(wrapper, {"cancelled", "unknown"})
+    MingTTSForConditionalGeneration.on_requests_finished(wrapper, {"cancelled"})
+    assert set(model._pending_postprocess_updates) == {"internal-b"}
+
+
+def test_ming_vae_finish_keeps_live_state_and_reused_ids_start_clean():
+    class RecordingCodec(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+            self.calls = []
+
+        def decode(self, latent, *, past_key_values, use_cache, stream_state, last_chunk):
+            self.calls.append((past_key_values, stream_state, last_chunk))
+            waveform = latent[..., 0].reshape(1, -1)
+            return waveform, (waveform, None, None), {"previous": waveform}
+
+    model = object.__new__(MingAudioVAEModel)
+    torch.nn.Module.__init__(model)
+    model.audio = RecordingCodec()
+    model.ming_config = SimpleNamespace(sample_rate=SAMPLE_RATE, latent_dim=LATENT_DIM, patch_size=PATCH_SIZE)
+    model.vllm_config = SimpleNamespace(device_config=SimpleNamespace(device=torch.device("cpu")))
+    model._past_key_values = {}
+    model._stream_state = {}
+    model._patch_totals = {}
+    model._sample_totals = {}
+    model._state_access_times = OrderedDict()
+    caches = (
+        model._past_key_values,
+        model._stream_state,
+        model._patch_totals,
+        model._sample_totals,
+        model._state_access_times,
+    )
+
+    def info(value, finished=False):
+        return {
+            KEY_REQUEST_ID: "external-shared-id",
+            "latent": torch.full((1, PATCH_SIZE, LATENT_DIM), value),
+            "meta": {"stream_finished": finished},
+        }
+
+    model.forward(model_intermediate_buffer=[info(1.0), info(2.0)], request_ids=["cancelled", "live"])
+    assert all(set(cache) == {"cancelled", "live"} for cache in caches)
+    live_state = model._past_key_values["live"]
+    wrapper = SimpleNamespace(model=model)
+    MingTTSForConditionalGeneration.on_requests_finished(wrapper, {"cancelled", "unknown"})
+    MingTTSForConditionalGeneration.on_requests_finished(wrapper, {"cancelled"})
+    assert all(set(cache) == {"live"} for cache in caches)
+
+    output = model.forward(
+        model_intermediate_buffer=[info(3.0, finished=True), info(4.0)], request_ids=["live", "cancelled"]
+    )
+    assert model.audio.calls[-2][0] is live_state
+    assert model.audio.calls[-2][2] is True
+    assert model.audio.calls[-1] == (None, (None, None, None), False)
+    assert all(set(cache) == {"cancelled"} for cache in caches)
+    assert model._patch_totals["cancelled"] == 1
+    assert model._sample_totals["cancelled"] == PATCH_SIZE
+    for waveform, value in zip(output.multimodal_outputs["model_outputs"], [3.0, 4.0], strict=True):
+        torch.testing.assert_close(waveform, torch.full((PATCH_SIZE,), value))
